@@ -6,7 +6,8 @@ LibCombatUnits = lcu
 local em = EventCallbackManager and EventCallbackManager:New("LCU_EventManager") or GetEventManager()
 local wm = GetWindowManager()
 
-local UnitHandler = ZO_Object:Subclass()
+local UnitHandler = ZO_InitializingObject:Subclass() -- internal object to store everything about a unit
+local UnitAPIHandler = ZO_InitializingObject:Subclass()	-- object to expose data about units
 
 -- Basic values
 lcu.name = "LibCombatUnits"
@@ -28,6 +29,7 @@ lcu.internal = {
 	petTagByName     = {},
 	effectCache      = {},
 	effectSlotCache  = {},
+	UnitExportCache  = {},
 	debugPanel       = {init = false},
 }
 
@@ -35,7 +37,9 @@ local lcuint           = lcu.internal
 local UnitCache       = lcuint.unitCache -- localized for performance reasons since it is called very often by OnCombatEvent
 local EffectCache     = lcuint.effectCache -- localized for performance reasons since it is called very often by OnCombatEvent
 local EffectSlotCache = lcuint.effectSlotCache -- localized for performance reasons since it is called very often by OnCombatEvent
+local UnitExportCache = lcuint.UnitExportCache -- localized for convinience
 
+---@diagnostic disable-next-line: undefined-global
 local COMBAT_UNIT_TYPE_GROUP_COMPANION = COMBAT_UNIT_TYPE_GROUP_COMPANION or (COMBAT_UNIT_TYPE_GROUP + 100)
 
 -- Logger (requires LibDebugLogger)
@@ -208,16 +212,16 @@ local function onBossesChanged(_) -- Detect Bosses
 
 		if DoesUnitExist(unitTag) then
 
-			local rawname = GetUnitName(unitTag)
+			local rawName = GetUnitName(unitTag)
 
-			if bossTagByName[rawname] and bossTagByName[rawname] ~= unitTag then
+			if bossTagByName[rawName] and bossTagByName[rawName] ~= unitTag then
 
-				Print("dev", LOG_LEVEL_WARNING, "Multiple tags found for %s (%s, %s)", rawname, bossTagByName[rawname], unitTag)
-				bossTagByName[rawname] = hasMultipleTags
+				Print("dev", LOG_LEVEL_WARNING, "Multiple tags found for %s (%s, %s)", rawName, bossTagByName[rawName], unitTag)
+				bossTagByName[rawName] = hasMultipleTags
 
 			end
 
-			lcuint.bossTagByName[rawname] = bossTagByName[rawname]
+			lcuint.bossTagByName[rawName] = bossTagByName[rawName]
 
 		end
 	end
@@ -241,7 +245,7 @@ local function onPlayerPetsChanged(_) -- TODO: figure out when to call this
 	end
 end
 
-local unitDetectionResults = {
+local unitDetectionResults = {	-- valid values of result from combat events to determine info from
 
 	[ACTION_RESULT_DAMAGE] = true,
 	[ACTION_RESULT_CRITICAL_DAMAGE] = true,
@@ -293,9 +297,6 @@ local unitDetectionResults = {
 
 }
 
-local onCombatEventRun = false
-local onCombatEventRunValid = false
-
 local function OnCombatEvent(eventCode, result, isError, abilityName, abilityGraphic, abilityActionSlotType, sourceName,
                              sourceType, targetName, targetType, hitValue, powerType, damageType, log, sourceUnitId,
                              targetUnitId, abilityId, overflow)
@@ -343,14 +344,19 @@ end
 local function OnTargetChange()
 
 	if not DoesUnitExist("reticleover") then
-		
-		UpdateUnitTagId("reticleover", nil)
-		Print("dev", LOG_LEVEL_INFO, "ReticleOverUnit removed.")
+
+		if lcuint.unitIdsByTag["reticleover"] then 
+
+			UpdateUnitTagId("reticleover", nil)
+			Print("dev", LOG_LEVEL_INFO, "ReticleOverUnit removed.")
+
+		end
 
 		return
 	end
+	local numBuffs = GetNumBuffs("reticleover")
 
-	for i = 1, GetNumBuffs("reticleover") do
+	for i = 1, numBuffs do
 
 		local _, _, endTime, buffSlot, _, _, _, _, _, _, abilityId, _ = GetUnitBuffInfo("reticleover", i)
 
@@ -366,6 +372,8 @@ local function OnTargetChange()
 
 		end
 	end
+
+	Print("dev", LOG_LEVEL_INFO, "ReticleOverUnit not found: %s (%d buffs)", GetUnitName("reticleover"), numBuffs)
 end
 
 local function OnEffectChanged(eventCode, changeType, effectSlot, effectName, unitTag, beginTime, endTime, stackCount,
@@ -397,12 +405,6 @@ end
 -- UnitHandler
 
 ---@diagnostic disable-next-line: duplicate-set-field
-function UnitHandler:New(...)
-	local object = ZO_Object.New(self)
-	object:Initialize(...)
-	return object
-end
-
 function UnitHandler:Initialize(rawName, unitId, unitType, unitTag)
 
 	if unitType == COMBAT_UNIT_TYPE_PLAYER then	UpdatePlayerId(unitId) end
@@ -515,11 +517,6 @@ function UnitHandler:UpdateUnitTagData(unitTag)
 	self.isAlive = not IsUnitDeadOrReincarnating(unitTag)
 
 
-	-- Position 	TODO: this should be updated regularly
-
-	self.zoneId, self.worldX, self.worldY, self.worldZ = GetUnitWorldPosition(unitTag)
-	self.isInSameInstance = IsGroupMemberInSameWorldAsPlayer(unitTag)
-
 	-- TODO: Add more data from unitTag if possible
 
 end
@@ -562,7 +559,8 @@ end
 function UnitHandler:Delete()
 
 	UnitCache[self.unitId] = nil
-
+	UnitExportCache[self.unitId] = nil
+	
 	if self.unitTags then
 
 		for _, unitTag in pairs(self.unitTags) do
@@ -614,11 +612,69 @@ function UnitHandler:UpdateEffectData(abilityId, changeType, endTime, effectSlot
 	end
 end
 
+-- Unit object for exporting info
+
+---@diagnostic disable-next-line: duplicate-set-field
+function UnitAPIHandler:Initialize(unitId)
+
+	self.unitId = unitId
+
+	UnitExportCache[unitId] = self
+
+end
+
+function UnitAPIHandler:GetFullUnitData()
+
+	local unitData = {
+
+		["unitId"]   = self.unitId,
+		["name"]     = self:GetUnitName(),
+		["rawName"]  = self:GetUnitRawName(),
+		["unitType"] = self:GetUnitType()
+
+	}
+
+	return unitData
+
+end
+
+function UnitAPIHandler:GetUnitName()
+
+	return UnitCache[self.unitId].name
+
+end
+
+function UnitAPIHandler:GetUnitRawName()
+
+	return UnitCache[self.unitId].rawName
+
+end
+
+function UnitAPIHandler:GetUnitType()
+
+	return UnitCache[self.unitId].unitType
+
+end
+
+function UnitAPIHandler:GetUnitTags()
+
+	return UnitCache[self.unitId].unitTags
+
+end
+
+local function GetExportUnit(unitId)
+
+	return UnitExportCache[unitId] or UnitAPIHandler:New(unitId)
+
+end
+
 -- API
 
 function lcu.GetUnitByTag(unitTag)
 
-	return ZO_DeepTableCopy(UnitCache[lcuint.unitIdsByTag[unitTag]])
+	local unitId = lcuint.unitIdsByTag[unitTag]
+
+	return GetExportUnit(unitId)
 
 end
 
@@ -635,7 +691,7 @@ function lcu.GetUnitsByName(unitName)
 	local units = {}
 
 	for i, unitId in ipairs(unitIds) do
-		units[i] = ZO_DeepTableCopy(UnitCache[unitId])
+		units[i] = GetExportUnit(unitId)
 	end
 
 	return unpack(units)
@@ -654,7 +710,7 @@ function lcu.GetUnitsByRawName(unitName)
 	local units = {}
 
 	for i, unitId in ipairs(unitIds) do
-		units[i] = ZO_DeepTableCopy(UnitCache[unitId])
+		units[i] = GetExportUnit(unitId)
 	end
 
 	return unpack(units)
@@ -669,7 +725,7 @@ end
 
 function lcu.GetUnitById(unitId)
 
-	return ZO_DeepTableCopy(UnitCache[unitId])
+	return GetExportUnit(unitId)
 
 end
 
@@ -698,23 +754,21 @@ end
 
 local function InitDebugPanel()
 
-	local debugPanel = lcuint.debugPanel
-
 	local tlw = wm:CreateTopLevelWindow("LCUDebugPanel")
 	local bg = wm:CreateControl("Bg", tlw, CT_BACKDROP)
 	wm:ApplyTemplateToControl(bg, "ZO_EditBackdrop")
 	local textbox = wm:CreateControl("TextBox", tlw, CT_EDITBOX)
 	wm:ApplyTemplateToControl(textbox, "ZO_DefaultEditForBackdrop")
 	wm:ApplyTemplateToControl(textbox, "ZO_EditDefaultText")
-	---@cast textbox EditControl
-
+	
 	tlw:SetMouseEnabled(true)
 	tlw:SetMovable(true)
 	tlw:SetAnchor(TOPLEFT, GuiRoot, TOPLEFT, 0, 0)
-	tlw:SetDimensions(300, 1000)
-
+	tlw:SetDimensions(500, 1000)
+	
 	bg:SetAnchorFill(tlw)
-
+	
+	---@cast textbox EditControl
 	textbox:SetAnchorFill(tlw)
 	textbox:SetMultiLine(true)
 	textbox:SetNewLineEnabled(true)
